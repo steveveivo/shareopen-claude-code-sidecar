@@ -39,8 +39,8 @@
  *   3. (optional) Wire Claude Code hooks to push progress (see README).
  */
 
-import { ShareOpenConnector } from './sdk/index.js'
-import { handleCommand, registerBuiltins } from './builtin-commands.js'
+import { ShareOpenConnector } from '../../sdk/node/index.js'
+import { handleCommand, registerBuiltins } from '../builtin-commands.js'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -52,7 +52,7 @@ const args = parseArgs(process.argv.slice(3))
 const agentId = args['agent-id'] || process.env.CC_AGENT_ID || ''
 const soToken = args.token || process.env.SO_AGENT_TOKEN || ''
 const shareopen = args.shareopen || process.env.SHAREOPEN_URL || 'http://localhost:3021'
-const workdir = args['workdir'] || process.cwd()
+const workdir = args['workdir'] || join(process.env.HOME || '', '.claude') // [2026-11-18] 默认指向 Claude 底座目录, 不用 shareopen connector 文件夹
 const claudeBin = args['claude-bin'] || process.env.CC_BIN || 'claude'
 const claudeModel = args['claude-model'] || process.env.CC_MODEL || ''
 
@@ -116,7 +116,13 @@ async function serve() {
 
     const prompt = buildPrompt(text, localAttachments, group)
     await sdk.typing(convId, true)
-    const result = await runClaudeHeadless(prompt, workdir)
+    // [align 2026-11-17] 工具执行进度 → progress_update 帧 (对齐 codex/hermes 进度条):
+    // claude CLI 跑 tool 期间用户看到"正在执行 X", 不再只有 typing 三点。
+    const onProgress = (tool) => {
+      console.log(`[claude-sidecar] progress ${convId}: tool ${tool}`)
+      sdk.progress(convId, `[claude-code] 执行 ${tool || '工具'}`, 'in_progress').catch(() => {})
+    }
+    const result = await runClaudeHeadless(prompt, workdir, { onProgress })
     await sdk.typing(convId, false)
 
     // Best-effort cleanup of staged media after the turn.
@@ -149,14 +155,18 @@ async function serve() {
 }
 
 /**
- * Run `claude -p <prompt>` headlessly and capture the JSON output.
+ * Run `claude -p <prompt>` headlessly.
+ * Uses `--output-format stream-json` so the assistant reply streams back as
+ * JSONL events; we accumulate text deltas into `chunks` (an async generator)
+ * for `sdk.stream`, plus the final `text` as a fallback.
  * Returns { text, chunks?, error? }.
  */
-function runClaudeHeadless(prompt, cwd) {
+function runClaudeHeadless(prompt, cwd, opts = {}) {
   return new Promise((resolve) => {
     const proc = spawn(claudeBin, [
       '-p', prompt,
-      '--output-format', 'json',
+      '--output-format', 'stream-json',
+      '--verbose',
       ...(claudeModel ? ['--model', claudeModel] : []),
     ], {
       cwd,
@@ -170,20 +180,72 @@ function runClaudeHeadless(prompt, cwd) {
 
     let stdout = ''
     let stderr = ''
-    proc.stdout.on('data', (d) => (stdout += d))
+    // [P0 2026-11-16] 真流式: 累积 stream-json 文本增量 → chunks 队列
+    const chunkQueue = []
+    let chunkWaiter = null
+    let done = false
+    const fullText = { v: '' }
+    const PACE_CHARS = 5   // 每帧字符数
+    const PACE_MS = 50     // 帧间节奏
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+    // [P0 2026-11-17 fix] 打字机节奏必须放在"消费侧"(yield 之间 sleep), 不能放在生产侧
+    //   (enqueue 里挂 setTimeout 去 wake 当时的 chunkWaiter): runClaudeHeadless 是 await 的,
+    //   等 sdk.stream 消费时 done 已 true、定时器全跑完 → 一次 flush 全文(无打字机);
+    //   且生产侧 chain 定时器无退出条件会钉住进程。生产侧只负责入队 + 唤醒。
+    const enqueue = (t) => {
+      if (!t) return
+      fullText.v += t
+      chunkQueue.push(t)
+      if (chunkWaiter) { const w = chunkWaiter; chunkWaiter = null; w() }
+    }
+    proc.stdout.on('data', (d) => {
+      stdout += d
+      const lines = stdout.split('\n')
+      stdout = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const ev = JSON.parse(line)
+          // Claude Code stream-json: assistant text arrives in
+          // { type: 'assistant', message: { content: [{ type: 'text', text }] } }
+          // or { type: 'result', result }.
+          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+            for (const c of ev.message.content) {
+              if (c && c.type === 'text' && c.text) enqueue(c.text)
+              // [align 2026-11-17] tool_use 事件 → 进度帧 (对齐 codex onProgress):
+              // 用户看到"正在执行 Read/Bash/..."而非只有 typing 三点。
+              else if (c && c.type === 'tool_use') opts.onProgress?.(c.name)
+            }
+          } else if (ev.type === 'result' && ev.result) {
+            // final result 兜底: 若之前没流式吐过, 补全量
+            if (!fullText.v) enqueue(ev.result)
+          }
+        } catch (_) {}
+      }
+    })
     proc.stderr.on('data', (d) => (stderr += d))
 
     proc.on('close', (code) => {
       if (code !== 0) {
         return resolve({ error: stderr.slice(0, 500) || `claude exited ${code}` })
       }
-      try {
-        const parsed = JSON.parse(stdout)
-        // Claude Code JSON output: { result, total_cost_usd, ... }
-        resolve({ text: parsed.result || stdout })
-      } catch {
-        resolve({ text: stdout })
-      }
+      done = true
+      if (chunkWaiter) { const w = chunkWaiter; chunkWaiter = null; w() }
+      // chunks: 异步生成器, 逐帧(每帧 PACE_CHARS 字, 帧间 PACE_MS) yield 已累积的增量
+      const chunks = (async function* () {
+        let i = 0
+        while (i < chunkQueue.length || !done) {
+          while (i < chunkQueue.length) {
+            const t = chunkQueue[i++]
+            for (let p = 0; p < t.length; p += PACE_CHARS) {
+              yield t.slice(p, p + PACE_CHARS)
+              if (p + PACE_CHARS < t.length) await sleep(PACE_MS)
+            }
+          }
+          if (!done) await new Promise((r) => { chunkWaiter = r })
+        }
+      })()
+      resolve({ text: fullText.v || stdout, chunks })
     })
 
     proc.on('error', (e) => resolve({ error: e.message }))
